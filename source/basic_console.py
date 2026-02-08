@@ -1,16 +1,25 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import serial
+import time
 
 # ---------------- Constants ----------------
 UART_PORT = "COM3"  # Change this if your RISC-V UART appears on a different COM port
 BAUDRATE = 115200
-TIMEOUT = 0.5
+TIMEOUT = 1.0
 
 # Sensor register addresses
 REG_ANALOG_GAIN = "0157"
 REG_EXPO_MSB    = "015A"
 REG_EXPO_LSB    = "015B"
+
+
+# ---------------- CCM (Color Correction Matrix) ----------------
+CCM_COEFFS = [
+    ("MRR", "05"), ("MRG", "06"), ("MRB", "07"),
+    ("MGR", "08"), ("MGG", "09"), ("MGB", "0A"),
+    ("MBR", "0B"), ("MBG", "0C"), ("MBB", "0D"),
+]
 
 
 # ---------------- Serial helpers ----------------
@@ -24,13 +33,47 @@ class SensorLink:
                 baudrate=BAUDRATE,
                 timeout=TIMEOUT
             )
+             # Switch off verbose mode immediately
+            self.send_cmd("V OFF")
         except Exception as e:
             raise RuntimeError(f"Failed to open UART port {UART_PORT}: {e}")
 
+    # CCM helpers
+    def ccm_read(self, addr):
+        return self.send_cmd(f"C R {addr}")
+
+    def ccm_write(self, addr, value):
+        return self.send_cmd(f"C W {addr} {value}")
+
+    def ccm_upload(self):
+        return self.send_cmd("C U")
+
     def send_cmd(self, cmd):
         """Send a command and return the first line of response."""
+        # Send the command and read lines until we get a non-empty response
         self.ser.write((cmd + "\r\n").encode("ascii"))
-        return self.ser.readline().decode("ascii", errors="ignore").strip()
+        try:
+            self.ser.flush()
+        except Exception:
+            pass
+
+        deadline = time.time() + TIMEOUT
+        while time.time() < deadline:
+            line = self.ser.readline()
+            if not line:
+                continue
+            try:
+                text = line.decode("ascii", errors="ignore").strip()
+            except Exception:
+                text = ""
+
+            # Remove common prompt characters (e.g. leading '>') and whitespace
+            text = text.lstrip('> ').strip()
+            if text:
+                return text
+
+        # No meaningful response received within timeout
+        return ""
 
     def read_reg(self, addr):
         """Read a register from the sensor firmware."""
@@ -63,42 +106,138 @@ class SensorGUI(tk.Tk):
             row=0, column=0, columnspan=4, pady=(0, 10)
         )
 
-        # Rows: label, entry, read, write
-        self._make_row(main, 1, "Analog Gain", REG_ANALOG_GAIN)
-        self._make_row(main, 2, "Exposure MSB", REG_EXPO_MSB)
-        self._make_row(main, 3, "Exposure LSB", REG_EXPO_LSB)
+        # Rows: label, entry, read, write (sensor registers)
+        self._make_row(main, 1, "Analog Gain", REG_ANALOG_GAIN, cmd_type='S', mode='hex')
+        self._make_row(main, 2, "Exposure MSB", REG_EXPO_MSB, cmd_type='S', mode='hex')
+        self._make_row(main, 3, "Exposure LSB", REG_EXPO_LSB, cmd_type='S', mode='hex')
+
+        # CCM section header
+        ttk.Label(main, text="Color Correction Matrix", font=(None, 10, 'bold')).grid(
+            row=4, column=0, columnspan=4, pady=(8, 4), sticky='w'
+        )
+
+        # CCM coefficient rows start at row 5
+        r = 5
+        for name, addr in CCM_COEFFS:
+            self._make_row(main, r, name, addr, cmd_type='C', mode='signed')
+            r += 1
+
+        # Verbose off and Upload buttons
+        ttk.Button(main, text="Verbose Off", command=self._verbose_off).grid(
+            row=r, column=0, columnspan=2, pady=(10, 5), sticky="ew"
+        )
+        ttk.Button(main, text="Upload to CCM", command=self._upload_ccm).grid(
+            row=r, column=2, columnspan=2, pady=(10, 5), sticky="ew"
+        )
 
         # Log box
-        self.log = tk.Text(main, width=50, height=6, state="disabled")
-        self.log.grid(row=4, column=0, columnspan=4, pady=(10, 0))
+        self.log = tk.Text(main, width=50, height=8, state="disabled")
+        self.log.grid(row=r+1, column=0, columnspan=4, pady=(0, 0))
 
-    def _make_row(self, parent, row, label, addr):
+    def _make_row(self, parent, row, label, addr, cmd_type='S', mode='hex'):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
 
         entry = ttk.Entry(parent, width=10)
         entry.grid(row=row, column=1, padx=5)
 
-        ttk.Button(parent, text="Read", command=lambda: self._read(addr, entry)).grid(row=row, column=2, padx=5)
-        ttk.Button(parent, text="Write", command=lambda: self._write(addr, entry)).grid(row=row, column=3, padx=5)
+        # default cmd_type 'S' (sensor), mode 'hex'. For CCM pass cmd_type='C' and mode='signed'
+        def make_read():
+            return lambda: self._read(addr, entry, cmd_type=cmd_type, mode=mode)
 
-    def _read(self, addr, entry):
-        """Read the register value and update the entry box."""
+        def make_write():
+            return lambda: self._write(addr, entry, cmd_type=cmd_type, mode=mode)
+
+        ttk.Button(parent, text="Read", command=make_read()).grid(row=row, column=2, padx=5)
+        ttk.Button(parent, text="Write", command=make_write()).grid(row=row, column=3, padx=5)
+
+    def _read(self, addr, entry, cmd_type='S', mode='hex'):
+        """Read the register value and update the entry box.
+
+        cmd_type: 'S' for sensor (S R), 'C' for CCM (C R)
+        mode: 'hex' to strip 0x prefix, 'signed' to display signed decimal
+        """
         try:
-            resp = self.link.read_reg(addr)
+            if cmd_type == 'C':
+                resp = self.link.ccm_read(addr)
+            else:
+                resp = self.link.read_reg(addr)
+
             self._log(f"READ {addr} -> {resp}")
+
+            if not resp:
+                display_val = ""
+            else:
+                # If response starts with 0x, strip that prefix; otherwise leave as-is
+                if resp.lower().startswith('0x') and mode == 'hex':
+                    display_val = resp[2:]
+                else:
+                    display_val = resp
+
             entry.delete(0, tk.END)
-            entry.insert(0, resp)
+            entry.insert(0, display_val)
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    def _write(self, addr, entry):
-        """Write the value from the entry box to the register."""
+    def _write(self, addr, entry, cmd_type='S', mode='hex'):
+        """Write the value from the entry box to the register.
+
+        cmd_type: 'S' for sensor (S W), 'C' for CCM (C W)
+        mode: 'hex' to send hex digits (strip leading 0x), 'signed' to send signed decimal
+        """
         value = entry.get().strip()
         if not value:
             return
+
+        # Prepare value according to mode
+        if mode == 'hex':
+            # Strip optional 0x prefix
+            if value.lower().startswith('0x'):
+                value_to_send = value[2:]
+            else:
+                value_to_send = value
+
+            if not value_to_send:
+                messagebox.showwarning("Invalid input", "Please enter a valid hex value.")
+                return
+
+        elif mode == 'signed':
+            # Accept leading + or - and integer digits
+            try:
+                intval = int(value, 10)
+            except Exception:
+                messagebox.showwarning("Invalid input", "Please enter a signed integer (-99..99).")
+                return
+            if intval < -99 or intval > 99:
+                messagebox.showwarning("Out of range", "Value must be between -99 and 99.")
+                return
+            # Send exactly as decimal string
+            value_to_send = str(intval)
+
+        else:
+            value_to_send = value
+
         try:
-            resp = self.link.write_reg(addr, value)
-            self._log(f"WRITE {addr} = {value} -> {resp}")
+            if cmd_type == 'C':
+                resp = self.link.ccm_write(addr, value_to_send)
+            else:
+                resp = self.link.write_reg(addr, value_to_send)
+            self._log(f"WRITE {addr} = {value_to_send} -> {resp}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _upload_ccm(self):
+        """Send the CCM upload command (C U)."""
+        try:
+            resp = self.link.ccm_upload()
+            self._log(f"UPLOAD CCM -> {resp}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _verbose_off(self):
+        """Send the Verbose Off command to the sensor."""
+        try:
+            resp = self.link.send_cmd("V OFF")
+            self._log(f"VERBOSE OFF -> {resp}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
