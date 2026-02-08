@@ -21,6 +21,13 @@ CCM_COEFFS = [
     ("MBR", "0B"), ("MBG", "0C"), ("MBB", "0D"),
 ]
 
+# ---------------- Translation Matrix ----------------
+TRANSLATION_COEFFS = [
+    ("Translation R", "02"),
+    ("Translation G", "03"),
+    ("Translation B", "04"),
+]
+
 
 # ---------------- Serial helpers ----------------
 
@@ -45,6 +52,14 @@ class SensorLink:
     def ccm_write(self, addr, value):
         return self.send_cmd(f"C W {addr} {value}")
 
+    # Translation Matrix helpers
+    def translation_read(self, addr):
+        return self.send_cmd(f"T R {addr}")
+
+    def translation_write(self, addr, value):
+        return self.send_cmd(f"T W {addr} {value}")
+
+    # Upload both CCM and Translation matrices
     def ccm_upload(self):
         return self.send_cmd("C U")
 
@@ -122,6 +137,17 @@ class SensorGUI(tk.Tk):
             self._make_row(main, r, name, addr, cmd_type='C', mode='signed')
             r += 1
 
+        # Translation Matrix section header
+        ttk.Label(main, text="Translation Matrix", font=(None, 10, 'bold')).grid(
+            row=r, column=0, columnspan=4, pady=(8, 4), sticky='w'
+        )
+        r += 1
+
+        # Translation coefficient rows
+        for name, addr in TRANSLATION_COEFFS:
+            self._make_row(main, r, name, addr, cmd_type='T', mode='signed')
+            r += 1
+
         # Verbose off and Upload buttons
         ttk.Button(main, text="Verbose Off", command=self._verbose_off).grid(
             row=r, column=0, columnspan=2, pady=(10, 5), sticky="ew"
@@ -153,12 +179,14 @@ class SensorGUI(tk.Tk):
     def _read(self, addr, entry, cmd_type='S', mode='hex'):
         """Read the register value and update the entry box.
 
-        cmd_type: 'S' for sensor (S R), 'C' for CCM (C R)
+        cmd_type: 'S' for sensor (S R), 'C' for CCM (C R), 'T' for translation (T R)
         mode: 'hex' to strip 0x prefix, 'signed' to display signed decimal
         """
         try:
             if cmd_type == 'C':
                 resp = self.link.ccm_read(addr)
+            elif cmd_type == 'T':
+                resp = self.link.translation_read(addr)
             else:
                 resp = self.link.read_reg(addr)
 
@@ -181,7 +209,7 @@ class SensorGUI(tk.Tk):
     def _write(self, addr, entry, cmd_type='S', mode='hex'):
         """Write the value from the entry box to the register.
 
-        cmd_type: 'S' for sensor (S W), 'C' for CCM (C W)
+        cmd_type: 'S' for sensor (S W), 'C' for CCM (C W), 'T' for translation (T W)
         mode: 'hex' to send hex digits (strip leading 0x), 'signed' to send signed decimal
         """
         value = entry.get().strip()
@@ -205,11 +233,21 @@ class SensorGUI(tk.Tk):
             try:
                 intval = int(value, 10)
             except Exception:
-                messagebox.showwarning("Invalid input", "Please enter a signed integer (-99..99).")
+                messagebox.showwarning("Invalid input", "Please enter a signed integer.")
                 return
-            if intval < -99 or intval > 99:
-                messagebox.showwarning("Out of range", "Value must be between -99 and 99.")
+
+            # Validate range based on command type
+            if cmd_type == 'T':
+                min_val, max_val = -255, 255
+                range_str = "(-255..255)"
+            else:  # 'C' or other
+                min_val, max_val = -99, 99
+                range_str = "(-99..99)"
+
+            if intval < min_val or intval > max_val:
+                messagebox.showwarning("Out of range", f"Value must be between {min_val} and {max_val} {range_str}.")
                 return
+
             # Send exactly as decimal string
             value_to_send = str(intval)
 
@@ -219,6 +257,8 @@ class SensorGUI(tk.Tk):
         try:
             if cmd_type == 'C':
                 resp = self.link.ccm_write(addr, value_to_send)
+            elif cmd_type == 'T':
+                resp = self.link.translation_write(addr, value_to_send)
             else:
                 resp = self.link.write_reg(addr, value_to_send)
             self._log(f"WRITE {addr} = {value_to_send} -> {resp}")
