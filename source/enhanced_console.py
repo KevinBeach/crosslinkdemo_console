@@ -9,6 +9,7 @@ UART_PORT = "COM3"  # Change this if your RISC-V UART appears on a different COM
 BAUDRATE = 115200
 TIMEOUT = 1.0
 
+
 # Sensor register addresses
 REG_ANALOG_GAIN = "0157"
 REG_EXPO_MSB    = "015A"
@@ -228,25 +229,37 @@ class SensorGUI(tk.Tk):
         self.control_frame = ttk.Frame(self, padding=10)
         self.control_frame.grid(row=1, column=0, columnspan=1, sticky='ew')
 
-        main = self.control_frame
-
         # Port label at the top
-        ttk.Label(main, text=f"Connected to {UART_PORT}", foreground="green").grid(
+        ttk.Label(self.control_frame, text=f"Connected to {UART_PORT}", foreground="green").grid(
             row=0, column=0, columnspan=4, pady=(0, 10)
         )
 
+        # Create notebook for tabs
+        notebook = ttk.Notebook(self.control_frame)
+        notebook.grid(row=1, column=0, columnspan=4, sticky='ew', pady=(10, 0))
+
+        # Tab 1: Sensor Registers
+        tab1 = ttk.Frame(notebook, padding=10)
+        notebook.add(tab1, text="Sensor Registers")
+
+        # Tab 2: Advanced Settings
+        tab2 = ttk.Frame(notebook, padding=10)
+        notebook.add(tab2, text="Advanced Settings")
+
+        main = tab1
+
         # Rows: label, entry, read, write (sensor registers)
-        self._make_row(main, 1, "Analog Gain", REG_ANALOG_GAIN, cmd_type='S', mode='hex')
-        self._make_row(main, 2, "Exposure MSB", REG_EXPO_MSB, cmd_type='S', mode='hex')
-        self._make_row(main, 3, "Exposure LSB", REG_EXPO_LSB, cmd_type='S', mode='hex')
+        self._make_row(main, 0, "Analog Gain", REG_ANALOG_GAIN, cmd_type='S', mode='hex')
+        self._make_row(main, 1, "Exposure MSB", REG_EXPO_MSB, cmd_type='S', mode='hex')
+        self._make_row(main, 2, "Exposure LSB", REG_EXPO_LSB, cmd_type='S', mode='hex')
 
         # CCM section header
         ttk.Label(main, text="Color Correction Matrix", font=(None, 10, 'bold')).grid(
-            row=4, column=0, columnspan=4, pady=(8, 4), sticky='w'
+            row=3, column=0, columnspan=4, pady=(8, 4), sticky='w'
         )
 
-        # CCM coefficient rows start at row 5
-        r = 5
+        # CCM coefficient rows start at row 4
+        r = 4
         for name, addr in CCM_COEFFS:
             self._make_row(main, r, name, addr, cmd_type='C', mode='signed')
             r += 1
