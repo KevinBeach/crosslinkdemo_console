@@ -1,8 +1,10 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import serial
 import serial.tools.list_ports
 import time
+import os
+import threading
 
 # ---------------- Constants ----------------
 UART_PORT = "COM3"  # Change this if your RISC-V UART appears on a different COM port
@@ -149,6 +151,8 @@ class SensorGUI(tk.Tk):
         self.link = SensorLink()  # Not yet connected
         self.control_frame = None  # Will be created after connection
         self.port_var = tk.StringVar()
+        # Holds 128 32-bit words loaded from a .mem file (list of ints)
+        self.gamma_mem = None
 
         self._build_connection_ui()
 
@@ -245,6 +249,8 @@ class SensorGUI(tk.Tk):
         # Tab 2: Gamma Settings
         tab2 = ttk.Frame(notebook, padding=10)
         notebook.add(tab2, text="Gamma Settings")
+        # Build gamma UI into tab2
+        self._build_gamma_tab(tab2)
 
         main = tab1
 
@@ -402,6 +408,216 @@ class SensorGUI(tk.Tk):
         try:
             resp = self.link.ccm_upload()
             self._log(f"UPLOAD CCM -> {resp}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _build_gamma_tab(self, parent):
+        """Construct the Gamma Settings UI: load .mem and display contents."""
+        # Header
+        ttk.Label(parent, text="Gamma Memory (.mem)", font=(None, 10, 'bold')).grid(
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, 6)
+        )
+
+        # Load button
+        self.gamma_loadfile_btn = ttk.Button(parent, text="Load .mem...", command=self._load_gamma_file)
+        self.gamma_loadfile_btn.grid(row=1, column=0, sticky='w')
+
+        # Status label
+        self.gamma_status_label = ttk.Label(parent, text="No file loaded")
+        self.gamma_status_label.grid(row=1, column=1, sticky='w', padx=(8, 0))
+
+        # Gamma Load (write to device) button (right side)
+        self.gamma_load_btn = ttk.Button(parent, text="Gamma Load", command=self._on_gamma_load)
+        self.gamma_load_btn.grid(row=1, column=2, sticky='e')
+
+        # Gamma Status field with Read/Write buttons
+        ttk.Label(parent, text="Gamma Status:", font=(None, 9)).grid(
+            row=3, column=0, sticky='w', pady=(10, 4)
+        )
+        self.gamma_status_entry = ttk.Entry(parent, width=20)
+        self.gamma_status_entry.grid(row=3, column=1, sticky='w', padx=(8, 0))
+        ttk.Button(parent, text="Read", command=self._read_gamma_status).grid(
+            row=3, column=1, sticky='e', padx=(0, 60)
+        )
+        ttk.Button(parent, text="Write", command=self._write_gamma_status).grid(
+            row=3, column=2, sticky='w'
+        )
+
+        # Display area for loaded values
+        self.gamma_text = tk.Text(parent, width=60, height=12, state='disabled')
+        self.gamma_text.grid(row=4, column=0, columnspan=3, pady=(8, 0))
+
+    def _load_gamma_file(self):
+        """Open a file dialog to select a .mem file and load 128 32-bit hex words."""
+        path = filedialog.askopenfilename(
+            title="Open .mem file",
+            filetypes=[("MEM files", "*.mem"), ("All files", "*")]
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                lines = [ln.strip() for ln in f.readlines()]
+
+            # Filter out empty lines
+            items = [ln for ln in lines if ln != ""]
+
+            if len(items) != 128:
+                messagebox.showerror("Invalid file", f"Expected 128 non-empty lines, found {len(items)}.")
+                return
+
+            parsed = []
+            for i, ln in enumerate(items):
+                # Allow comments after whitespace - take first token
+                token = ln.split()[0]
+                if token.lower().startswith('0x'):
+                    token = token[2:]
+                try:
+                    val = int(token, 16)
+                except Exception:
+                    messagebox.showerror("Parse error", f"Line {i+1} is not a valid hex word: '{ln}'")
+                    return
+
+                if val < 0 or val > 0xFFFFFFFF:
+                    messagebox.showerror("Value out of range", f"Line {i+1} value out of 32-bit range: {val}")
+                    return
+
+                parsed.append(val)
+
+            # Success: store and display
+            self.gamma_mem = parsed
+            fname = os.path.basename(path)
+            self.gamma_status_label.config(text=f"Loaded: {fname}")
+            self._display_gamma_mem()
+            self._log(f"Loaded gamma .mem: {path}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load file: {e}")
+
+    def _display_gamma_mem(self):
+        """Display the loaded gamma memory in the gamma_text widget."""
+        if self.gamma_mem is None:
+            return
+
+        self.gamma_text.configure(state='normal')
+        self.gamma_text.delete('1.0', tk.END)
+        for i, val in enumerate(self.gamma_mem):
+            self.gamma_text.insert(tk.END, f"{i:03d}: 0x{val:08X}\n")
+        self.gamma_text.configure(state='disabled')
+
+    def _on_gamma_load(self):
+        """Start background thread to write gamma data to the FPGA via serial."""
+        if self.gamma_mem is None:
+            messagebox.showwarning("No data", "No gamma data loaded. Please load a .mem file first.")
+            return
+
+        if not self.link.is_connected():
+            messagebox.showwarning("Not connected", "Serial link not connected. Connect before loading.")
+            return
+
+        # Disable buttons to prevent re-entry
+        try:
+            self.gamma_load_btn.config(state='disabled')
+            self.gamma_loadfile_btn.config(state='disabled')
+        except Exception:
+            pass
+        self.gamma_status_label.config(text="Starting gamma load...")
+
+        t = threading.Thread(target=self._gamma_load_worker, daemon=True)
+        t.start()
+
+    def _gamma_load_worker(self):
+        """Worker that sends F W <BASE> <OFFSET> <DATA> for each gamma entry.
+
+        Uses base address 0x51400 and offsets 0x300 + index.
+        """
+        try:
+            base_addr = 0x51700
+            offset = 0x00
+
+            count = min(len(self.gamma_mem), 128)
+            for i in range(count):
+                data = self.gamma_mem[i]
+
+                # Format as uppercase hex without 0x prefix
+                base_hex = f"{base_addr:X}"
+                offset_hex = f"{offset:02X}"
+                data_hex = f"{data:08X}"
+
+                cmd = f"F W {base_hex} {offset_hex} {data_hex}"
+
+                # Log command immediately (before sending)
+                self.after(0, lambda cmd=cmd: self._log(f"[GAMMA] {cmd}"))
+
+                # Send command and capture response
+                try:
+                    resp = self.link.send_cmd(cmd)
+                except Exception as e:
+                    # Report error and stop
+                    self.after(0, lambda e=e, i=i: messagebox.showerror("Write error", f"Failed at index {i}: {e}"))
+                    break
+
+                # Update status and log
+                self.after(0, lambda i=i, resp=resp: self._update_gamma_progress(i, resp))
+
+                # Increment base address by 4 for each write
+                base_addr += 4
+                # Offset remains 00 for each write
+
+            else:
+                # Completed all entries
+                self.after(0, lambda: self.gamma_status_label.config(text=f"Gamma load complete ({count} entries)"))
+                self.after(0, lambda: self._log(f"Gamma load complete: {count} entries"))
+
+        finally:
+            # Re-enable buttons
+            self.after(0, lambda: self.gamma_load_btn.config(state='normal'))
+            self.after(0, lambda: self.gamma_loadfile_btn.config(state='normal'))
+
+    def _update_gamma_progress(self, index, resp):
+        """Update UI for each write step (runs in main thread via after)."""
+        self.gamma_status_label.config(text=f"Writing {index+1} / {min(len(self.gamma_mem),128)}")
+        self._log(f"F W write idx {index} -> {resp}")
+
+    def _read_gamma_status(self):
+        """Read gamma status with command: F R 51400 00"""
+        if not self.link.is_connected():
+            messagebox.showwarning("Not connected", "Serial link not connected.")
+            return
+
+        try:
+            cmd = "F R 51400 00"
+            resp = self.link.send_cmd(cmd)
+            self._log(f"{cmd} -> {resp}")
+
+            # Clean response: remove 'x' prefix (if present) and leading zeros
+            cleaned = resp.strip()
+            if cleaned.lower().startswith('0x'):
+                cleaned = cleaned[2:]
+            # Remove leading zeros but keep at least one digit
+            cleaned = cleaned.lstrip('0') or '0'
+
+            self.gamma_status_entry.delete(0, tk.END)
+            self.gamma_status_entry.insert(0, cleaned)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _write_gamma_status(self):
+        """Write gamma status with command: F W 51400 00 <Data in box>"""
+        if not self.link.is_connected():
+            messagebox.showwarning("Not connected", "Serial link not connected.")
+            return
+
+        value = self.gamma_status_entry.get().strip()
+        if not value:
+            messagebox.showwarning("Empty value", "Please enter a value in the Gamma Status box.")
+            return
+
+        try:
+            cmd = f"F W 51400 00 {value}"
+            resp = self.link.send_cmd(cmd)
+            self._log(f"{cmd} -> {resp}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
